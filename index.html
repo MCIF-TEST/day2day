@@ -1,1 +1,123 @@
-index
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Daily Workflow App</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f5f5f5;
+      margin: 0;
+      padding: 20px;
+    }
+    h1 {
+      text-align: center;
+      margin-bottom: 20px;
+    }
+    .day-select {
+      display: flex;
+      justify-content: center;
+      gap: 20px;
+      margin-bottom: 30px;
+    }
+    button {
+      padding: 10px 20px;
+      font-size: 16px;
+      cursor: pointer;
+      border: none;
+      border-radius: 8px;
+      background: #222;
+      color: #fff;
+    }
+    .task-list {
+      max-width: 600px;
+      margin: 0 auto;
+      background: #fff;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+    }
+    .task {
+      display: flex;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid #ddd;
+    }
+    .task:last-child {
+      border-bottom: none;
+    }
+    .courses-section {
+      max-width: 600px;
+      margin: 30px auto;
+      background: #fff;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+    }
+  </style>
+</head>
+<body>
+  <h1>Daily Workflow</h1>
+
+  <div class="day-select">
+    <button onclick="setDay('A')">Day A</button>
+    <button onclick="setDay('B')">Day B</button>
+  </div>
+
+  <div class="task-list" id="taskList">
+    <h2>Select a Day</h2>
+  </div>
+
+  <div class="courses-section">
+    <h2>Courses & Links</h2>
+    <ul id="courseLinks">
+      <!-- Courses will be inserted here -->
+    </ul>
+  </div>
+
+  <script>
+    const dayA = [
+      { name: "Reading", time: "1 hour" },
+      { name: "Course Study", time: "1 hour" },
+      { name: "News Study", time: "30 minutes" },
+      { name: "Bible Reading", time: "45 minutes" }
+    ];
+
+    const dayB = [
+      { name: "Reading", time: "1 hour" },
+      { name: "GED Study", time: "1 hour" },
+      { name: "Course Study", time: "1 hour" },
+      { name: "News Study", time: "30 minutes" },
+      { name: "Bible Reading", time: "30 minutes" }
+    ];
+
+    const courses = [
+      // Add your courses like this:
+      // { name: "Course Title", url: "https://example.com" }
+    ];
+
+    function setDay(day) {
+      const list = document.getElementById('taskList');
+      const tasks = day === 'A' ? dayA : dayB;
+      list.innerHTML = `<h2>Day ${day} Tasks</h2>`;
+      tasks.forEach(task => {
+        list.innerHTML += `
+          <div class='task'>
+            <span>${task.name}</span>
+            <span>${task.time}</span>
+          </div>`;
+      });
+    }
+
+    function loadCourses() {
+      const courseList = document.getElementById('courseLinks');
+      courses.forEach(c => {
+        courseList.innerHTML += `<li><a href='${c.url}' target='_blank'>${c.name}</a></li>`;
+      });
+    }
+
+    loadCourses();
+  </script>
+</body>
+</html>
