@@ -1,23 +1,29 @@
-/* Industry-grade daily checklist (client-only)
-   - Stores progress per "discipline day" in localStorage
-   - Discipline day boundary = 2:00am America/Phoenix (not device timezone)
-   - Auto-resets at/after 2:00am Phoenix by switching dayKey
-   - Adds required "Fasting day" item on Wed + Sun (Phoenix-based)
-   - Data model versioning + pruning
+/* Discipline Checklist (robust persistence, Phoenix-locked reset)
+   - Resets ONLY at 2:00am America/Phoenix by discipline-day key rollover
+   - Primary persistence: IndexedDB (reliable across close/reopen)
+   - Fallback: localStorage
+   - Write-through autosave on changes + visibility/pagehide
 */
 
 (() => {
   "use strict";
 
   // ====== CONFIG ======
-  const RESET_HOUR_PHOENIX = 2; // 2:00am America/Phoenix
+  const RESET_HOUR_PHOENIX = 2;
   const PHX_TZ = "America/Phoenix";
-  const STORAGE_KEY = "discipline.checklist.v2";
-  const HISTORY_DAYS_TO_KEEP = 60;
 
-  // User clarified: OPTIONAL ITEMS ARE INCLUDED IN COMPLETION %
+  const DB_NAME = "discipline_checklist_db";
+  const DB_VERSION = 1;
+  const STORE_NAME = "kv";
+  const KV_KEY = "state_v3";
+
+  const LS_FALLBACK_KEY = "discipline.checklist.fallback.v3";
+  const HISTORY_DAYS_TO_KEEP = 90;
+
+  // User wants GED optional INCLUDED in completion %
   const EXCLUDE_OPTIONAL_FROM_PERCENT = false;
 
+  // ====== TASKS ======
   const BASE_TASKS = [
     { id: "wake_5am", label: "Wake up at 5am", desc: "Start on time.", required: true },
     { id: "pushups_50", label: "50 push ups", desc: "Strict form.", required: true },
@@ -25,8 +31,9 @@
     { id: "pullups_25", label: "25 pull ups outside", desc: "Full range.", required: true },
     { id: "bible_30", label: "Read Bible 30 mins", desc: "Timer: 30:00.", required: true },
     { id: "journal_am", label: "Journal (morning)", desc: "Plan, intention, focus.", required: true },
-    { id: "ged_optional", label: "Study GED", desc: "Optional.", required: false },
+    { id: "ged_optional", label: "Study GED", desc: "Optional, but counts in %.", required: false },
     { id: "hillsdale", label: "Study Hillsdale class", desc: "Show up daily.", required: true },
+    { id: "study_ai_45", label: "Study AI 45 mins", desc: "Timer: 45:00.", required: true },
     { id: "meditate_10", label: "Meditate 10 mins", desc: "Timer: 10:00.", required: true },
     { id: "journal_pm", label: "Journal (evening)", desc: "Review, accountability.", required: true },
     { id: "misc_read_30", label: "Read misc book 30 mins", desc: "Timer: 30:00.", required: true },
@@ -55,19 +62,18 @@
   const btnResetDay = $("#btnResetDay");
   const btnMarkAll = $("#btnMarkAll");
 
-  // ====== UTIL ======
+  // ====== UTILS ======
   const pad2 = (n) => String(n).padStart(2, "0");
 
   function safeJsonParse(str, fallback) {
     try { return JSON.parse(str); } catch { return fallback; }
   }
 
-  // ====== PHOENIX TIME CORE ======
-  // We compute Phoenix "wall time" using the timezone's offset at the current instant.
-  // Then we do all date logic in a "pseudo-UTC" space where getUTC* methods represent Phoenix wall time.
+  function nowMs() { return Date.now(); }
 
+  // ====== PHOENIX TIME CORE ======
   function getTimeZoneOffsetMinutes(timeZone, date = new Date()) {
-    // Prefer modern "shortOffset" (e.g., "GMT-07:00")
+    // Prefer modern "shortOffset" if supported
     try {
       const fmt = new Intl.DateTimeFormat("en-US", {
         timeZone,
@@ -77,17 +83,14 @@
       });
       const parts = fmt.formatToParts(date);
       const tzPart = parts.find(p => p.type === "timeZoneName")?.value || "";
-      // tzPart like "GMT-07:00" or "UTC-07:00"
       const m = tzPart.match(/([+-])(\d{2}):?(\d{2})/);
       if (m) {
         const sign = m[1] === "-" ? -1 : 1;
-        const hh = Number(m[2]);
-        const mm = Number(m[3]);
-        return sign * (hh * 60 + mm);
+        return sign * (Number(m[2]) * 60 + Number(m[3]));
       }
     } catch { /* fall through */ }
 
-    // Phoenix is effectively always UTC-07:00 (no DST). Fallback:
+    // Phoenix has no DST; fallback is always UTC-07:00
     return -7 * 60;
   }
 
@@ -95,13 +98,12 @@
     return getTimeZoneOffsetMinutes(PHX_TZ, now) * 60 * 1000;
   }
 
-  // "Phoenix wall clock epoch" (ms) represented as if it were UTC.
+  // Phoenix "wall time epoch", represented as pseudo-UTC in ms.
   function phoenixWallEpoch(now = new Date()) {
     return now.getTime() + phoenixOffsetMs(now);
   }
 
   function formatPhoenixNow(now = new Date()) {
-    // Format nicely using Intl with Phoenix TZ.
     const fmt = new Intl.DateTimeFormat("en-US", {
       timeZone: PHX_TZ,
       weekday: "short",
@@ -116,10 +118,9 @@
     return fmt.format(now);
   }
 
-  // Discipline day key: date of (Phoenix wall time - RESET_HOUR)
+  // Discipline day key = date of (Phoenix wall time - 2 hours)
   function getDisciplineDayKey(now = new Date()) {
-    const phxWall = phoenixWallEpoch(now);
-    const shifted = phxWall - RESET_HOUR_PHOENIX * 60 * 60 * 1000;
+    const shifted = phoenixWallEpoch(now) - RESET_HOUR_PHOENIX * 60 * 60 * 1000;
     const d = new Date(shifted);
     const y = d.getUTCFullYear();
     const m = pad2(d.getUTCMonth() + 1);
@@ -129,18 +130,15 @@
 
   function parseDayKeyToPhoenixNoonWallEpoch(dayKey) {
     const [y, m, d] = dayKey.split("-").map(Number);
-    // Noon wall time in Phoenix, represented as pseudo-UTC:
     return Date.UTC(y, m - 1, d, 12, 0, 0, 0);
   }
 
   function isFastingDay(dayKey) {
-    // Phoenix day of week based on the discipline dayKey
     const noonWall = parseDayKeyToPhoenixNoonWallEpoch(dayKey);
-    const dow = new Date(noonWall).getUTCDay(); // 0=Sun ... 3=Wed
+    const dow = new Date(noonWall).getUTCDay(); // 0 Sun, 3 Wed
     return dow === 0 || dow === 3;
   }
 
-  // Next reset instant in REAL epoch ms, based on Phoenix 2:00am.
   function nextResetRealEpoch(now = new Date()) {
     const offMs = phoenixOffsetMs(now);
     const phxWall = now.getTime() + offMs;
@@ -151,10 +149,8 @@
     const d = phxWallDate.getUTCDate();
 
     let resetWall = Date.UTC(y, m, d, RESET_HOUR_PHOENIX, 0, 0, 0);
-    if (phxWall >= resetWall) {
-      resetWall = Date.UTC(y, m, d + 1, RESET_HOUR_PHOENIX, 0, 0, 0);
-    }
-    // Convert wall->real by subtracting offset
+    if (phxWall >= resetWall) resetWall = Date.UTC(y, m, d + 1, RESET_HOUR_PHOENIX, 0, 0, 0);
+
     return resetWall - offMs;
   }
 
@@ -166,54 +162,6 @@
     return `${pad2(hh)}:${pad2(mm)}:${pad2(ss)}`;
   }
 
-  // ====== DATA MODEL ======
-  function defaultStore() {
-    return { version: 2, days: {}, updatedAt: Date.now() };
-  }
-
-  function loadStore() {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    const parsed = safeJsonParse(raw, null);
-    if (!parsed || typeof parsed !== "object") return defaultStore();
-    if (!parsed.days || typeof parsed.days !== "object") parsed.days = {};
-    if (!parsed.version) parsed.version = 2;
-    return parsed;
-  }
-
-  function saveStore(store) {
-    store.updatedAt = Date.now();
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
-  }
-
-  function pruneOldDays(store) {
-    const keys = Object.keys(store.days).sort(); // YYYY-MM-DD sorts chronologically
-    const extra = keys.length - HISTORY_DAYS_TO_KEEP;
-    if (extra <= 0) return;
-    for (let i = 0; i < extra; i++) delete store.days[keys[i]];
-  }
-
-  function ensureDayRecord(store, dayKey, tasks) {
-    if (!store.days[dayKey]) {
-      store.days[dayKey] = {
-        createdAt: Date.now(),
-        completed: {}, // taskId -> boolean
-        notes: {},
-      };
-    }
-
-    // Ensure every current task has a boolean entry
-    const rec = store.days[dayKey];
-    for (const t of tasks) {
-      if (typeof rec.completed[t.id] !== "boolean") rec.completed[t.id] = false;
-    }
-
-    // Remove tasks that no longer exist (keeps storage clean)
-    const validIds = new Set(tasks.map(t => t.id));
-    for (const id of Object.keys(rec.completed)) {
-      if (!validIds.has(id)) delete rec.completed[id];
-    }
-  }
-
   // ====== TASK SET ======
   function tasksForDay(dayKey) {
     const fasting = isFastingDay(dayKey);
@@ -221,7 +169,132 @@
     return { tasks, fasting };
   }
 
-  // ====== RENDER ======
+  // ====== STORAGE ENGINE (IndexedDB + fallback) ======
+  function openDb() {
+    return new Promise((resolve, reject) => {
+      if (!("indexedDB" in window)) return reject(new Error("IndexedDB not supported"));
+
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(STORE_NAME)) db.createObjectStore(STORE_NAME);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error || new Error("IndexedDB open failed"));
+    });
+  }
+
+  async function idbGet(db, key) {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readonly");
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.get(key);
+      req.onsuccess = () => resolve(req.result ?? null);
+      req.onerror = () => reject(req.error || new Error("IDB get failed"));
+    });
+  }
+
+  async function idbPut(db, key, value) {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.put(value, key);
+      req.onsuccess = () => resolve(true);
+      req.onerror = () => reject(req.error || new Error("IDB put failed"));
+    });
+  }
+
+  function lsGet() {
+    return safeJsonParse(localStorage.getItem(LS_FALLBACK_KEY), null);
+  }
+
+  function lsPut(value) {
+    try {
+      localStorage.setItem(LS_FALLBACK_KEY, JSON.stringify(value));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // ====== STATE MODEL ======
+  function defaultState() {
+    return {
+      version: 3,
+      updatedAt: nowMs(),
+      activeDayKey: null,
+      days: {} // dayKey -> { createdAt, completed: {id:boolean} }
+    };
+  }
+
+  function pruneOldDays(state) {
+    const keys = Object.keys(state.days).sort();
+    const extra = keys.length - HISTORY_DAYS_TO_KEEP;
+    if (extra <= 0) return;
+    for (let i = 0; i < extra; i++) delete state.days[keys[i]];
+  }
+
+  function ensureDayRecord(state, dayKey, tasks) {
+    if (!state.days[dayKey]) {
+      state.days[dayKey] = { createdAt: nowMs(), completed: {} };
+    }
+    const rec = state.days[dayKey];
+
+    for (const t of tasks) {
+      if (typeof rec.completed[t.id] !== "boolean") rec.completed[t.id] = false;
+    }
+    const valid = new Set(tasks.map(t => t.id));
+    for (const id of Object.keys(rec.completed)) {
+      if (!valid.has(id)) delete rec.completed[id];
+    }
+  }
+
+  // ====== SAVE COALESCING ======
+  let saveInFlight = false;
+  let saveQueued = false;
+  let lastSaveOk = false;
+  let storageMode = "IDB"; // or "LS"
+
+  async function persist(state, db) {
+    // Coalesce rapid saves into one at a time
+    if (saveInFlight) { saveQueued = true; return; }
+    saveInFlight = true;
+
+    try {
+      state.updatedAt = nowMs();
+
+      // Primary: IDB
+      if (db) {
+        await idbPut(db, KV_KEY, state);
+        lastSaveOk = true;
+        storageMode = "IDB";
+        // Also write fallback snapshot occasionally (best-effort)
+        lsPut(state);
+      } else {
+        // Fallback: localStorage only
+        lastSaveOk = lsPut(state);
+        storageMode = "LS";
+      }
+    } catch {
+      // If IDB write fails, fallback to LS
+      lastSaveOk = lsPut(state);
+      storageMode = "LS";
+    } finally {
+      saveInFlight = false;
+      if (saveQueued) { saveQueued = false; await persist(state, db); }
+    }
+  }
+
+  function setStatus(msg) {
+    statusEl.textContent = msg;
+  }
+
+  function statusSavedLine(now = new Date()) {
+    const ok = lastSaveOk ? "OK" : "FAIL";
+    return `Saved(${ok}) via ${storageMode} • ${formatPhoenixNow(now)}`;
+  }
+
+  // ====== PROGRESS ======
   function computeProgress(tasks, completedMap) {
     const eligible = tasks.filter(t => {
       if (!EXCLUDE_OPTIONAL_FROM_PERCENT) return true;
@@ -234,16 +307,27 @@
     return { done, total, pct };
   }
 
-  function render(dayKey, store) {
+  function refreshProgress(dayKey, state) {
+    const { tasks } = tasksForDay(dayKey);
+    const rec = state.days[dayKey];
+    const { done, total, pct } = computeProgress(tasks, rec.completed);
+
+    doneCountEl.textContent = String(done);
+    needCountEl.textContent = String(total);
+    pctEl.textContent = `${pct}%`;
+    barFillEl.style.width = `${pct}%`;
+  }
+
+  // ====== RENDER ======
+  function render(dayKey, state, db) {
     const { tasks, fasting } = tasksForDay(dayKey);
-    ensureDayRecord(store, dayKey, tasks);
+    ensureDayRecord(state, dayKey, tasks);
 
     dayKeyEl.textContent = dayKey;
     fastingPillEl.style.display = fasting ? "inline-flex" : "none";
 
-    // List
+    const rec = state.days[dayKey];
     listEl.innerHTML = "";
-    const rec = store.days[dayKey];
 
     for (const t of tasks) {
       const row = document.createElement("div");
@@ -258,11 +342,11 @@
       cb.checked = !!rec.completed[t.id];
       cb.setAttribute("aria-label", t.label);
 
-      cb.addEventListener("change", () => {
+      cb.addEventListener("change", async () => {
         rec.completed[t.id] = cb.checked;
-        saveStore(store);
-        refreshProgress(dayKey, store);
-        setStatus(`Saved • ${formatPhoenixNow(new Date())}`);
+        refreshProgress(dayKey, state);
+        await persist(state, db);
+        setStatus(statusSavedLine(new Date()));
       }, { passive: true });
 
       const meta = document.createElement("div");
@@ -295,96 +379,115 @@
 
       left.appendChild(cb);
       left.appendChild(meta);
-
       row.appendChild(left);
       listEl.appendChild(row);
     }
 
-    refreshProgress(dayKey, store);
-    saveStore(store);
+    refreshProgress(dayKey, state);
   }
 
-  function refreshProgress(dayKey, store) {
+  // ====== ACTIONS ======
+  async function markAll(state, db) {
+    const dayKey = state.activeDayKey;
     const { tasks } = tasksForDay(dayKey);
-    const rec = store.days[dayKey];
-    const { done, total, pct } = computeProgress(tasks, rec.completed);
-
-    doneCountEl.textContent = String(done);
-    needCountEl.textContent = String(total);
-    pctEl.textContent = `${pct}%`;
-    barFillEl.style.width = `${pct}%`;
-  }
-
-  function setStatus(msg) {
-    statusEl.textContent = msg;
-  }
-
-  // ====== CONTROLS ======
-  function markAll(dayKey, store) {
-    const { tasks } = tasksForDay(dayKey);
-    const rec = store.days[dayKey];
+    const rec = state.days[dayKey];
     for (const t of tasks) rec.completed[t.id] = true;
-    saveStore(store);
-    render(dayKey, store);
-    setStatus(`Marked all • ${formatPhoenixNow(new Date())}`);
+
+    render(dayKey, state, db);
+    await persist(state, db);
+    setStatus(`Marked all • ${statusSavedLine(new Date())}`);
   }
 
-  function resetDay(dayKey, store) {
+  async function resetToday(state, db) {
+    const dayKey = state.activeDayKey;
     const { tasks } = tasksForDay(dayKey);
-    const rec = store.days[dayKey];
+    const rec = state.days[dayKey];
     for (const t of tasks) rec.completed[t.id] = false;
-    saveStore(store);
-    render(dayKey, store);
-    setStatus(`Reset today • ${formatPhoenixNow(new Date())}`);
+
+    render(dayKey, state, db);
+    await persist(state, db);
+    setStatus(`Reset today • ${statusSavedLine(new Date())}`);
   }
 
-  // ====== CLOCK / AUTO-RESET ======
-  function tick(now, store) {
+  // ====== AUTO-RESET / TICK ======
+  async function tick(state, db) {
+    const now = new Date();
     phxNowEl.textContent = formatPhoenixNow(now);
 
     const nextReset = nextResetRealEpoch(now);
     countdownEl.textContent = formatCountdown(nextReset - now.getTime());
 
     const currentKey = getDisciplineDayKey(now);
-    const prevKey = store._activeDayKey;
+    if (state.activeDayKey !== currentKey) {
+      state.activeDayKey = currentKey;
 
-    if (prevKey !== currentKey) {
-      store._activeDayKey = currentKey;
       const { tasks } = tasksForDay(currentKey);
-      ensureDayRecord(store, currentKey, tasks);
-      pruneOldDays(store);
-      saveStore(store);
-      render(currentKey, store);
-      setStatus(`New discipline day loaded • ${formatPhoenixNow(now)}`);
+      ensureDayRecord(state, currentKey, tasks);
+      pruneOldDays(state);
+
+      render(currentKey, state, db);
+      await persist(state, db);
+      setStatus(`New discipline day loaded • ${statusSavedLine(now)}`);
     }
   }
 
-  // ====== BOOT ======
-  function boot() {
-    const store = loadStore();
+  // ====== LOAD ======
+  async function loadState(db) {
+    // Try IDB first
+    if (db) {
+      try {
+        const s = await idbGet(db, KV_KEY);
+        if (s && typeof s === "object") return s;
+      } catch { /* ignore */ }
+    }
+    // Fallback localStorage
+    const ls = lsGet();
+    if (ls && typeof ls === "object") return ls;
 
-    // Establish active dayKey immediately
+    return defaultState();
+  }
+
+  // ====== BOOT ======
+  async function boot() {
+    let db = null;
+    try { db = await openDb(); } catch { db = null; }
+
+    const state = await loadState(db);
+
     const now = new Date();
     const dayKey = getDisciplineDayKey(now);
-    store._activeDayKey = dayKey;
+    state.activeDayKey = dayKey;
 
     const { tasks } = tasksForDay(dayKey);
-    ensureDayRecord(store, dayKey, tasks);
-    pruneOldDays(store);
-    saveStore(store);
+    ensureDayRecord(state, dayKey, tasks);
+    pruneOldDays(state);
 
-    render(dayKey, store);
-    setStatus(`Ready • Phoenix-locked reset at 2:00am`);
+    render(dayKey, state, db);
+    await persist(state, db);
+    setStatus(`Ready • ${statusSavedLine(now)}`);
 
-    btnMarkAll.addEventListener("click", () => markAll(store._activeDayKey, store));
-    btnResetDay.addEventListener("click", () => {
+    // Buttons
+    btnMarkAll.addEventListener("click", () => markAll(state, db));
+    btnResetDay.addEventListener("click", async () => {
       const ok = confirm("Reset TODAY (current discipline day) back to unchecked?");
-      if (ok) resetDay(store._activeDayKey, store);
+      if (ok) await resetToday(state, db);
     });
 
-    // Tick every second (cheap UI update) + ensures reset triggers quickly after 2am Phoenix
-    tick(now, store);
-    setInterval(() => tick(new Date(), store), 1000);
+    // Hardening: save on tab hide / page close
+    document.addEventListener("visibilitychange", async () => {
+      if (document.visibilityState === "hidden") {
+        await persist(state, db);
+      }
+    });
+
+    // iOS Safari friendly: pagehide fires reliably on close/app switch
+    window.addEventListener("pagehide", async () => {
+      await persist(state, db);
+    });
+
+    // Run tick immediately, then every second to keep countdown & catch 2am quickly
+    await tick(state, db);
+    setInterval(() => { tick(state, db); }, 1000);
   }
 
   boot();
