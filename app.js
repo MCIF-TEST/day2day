@@ -1,8 +1,10 @@
-/* Discipline Checklist (robust persistence, Phoenix-locked reset)
-   - Resets ONLY at 2:00am America/Phoenix by discipline-day key rollover
-   - Primary persistence: IndexedDB (reliable across close/reopen)
-   - Fallback: localStorage
-   - Write-through autosave on changes + visibility/pagehide
+/* Warrior Checklist (industry-grade persistence + themes)
+   - Phoenix locked discipline day reset at 2:00am America/Phoenix
+   - Robust persistence: IndexedDB primary + localStorage snapshot fallback
+   - Save hardening: on change + visibilitychange + pagehide + periodic flush
+   - Cross-tab sync via BroadcastChannel
+   - Requests persistent storage to reduce eviction risk
+   - Device ID stored per device/browser
 */
 
 (() => {
@@ -12,16 +14,26 @@
   const RESET_HOUR_PHOENIX = 2;
   const PHX_TZ = "America/Phoenix";
 
-  const DB_NAME = "discipline_checklist_db";
+  // IndexedDB
+  const DB_NAME = "warrior_checklist_db";
   const DB_VERSION = 1;
   const STORE_NAME = "kv";
-  const KV_KEY = "state_v3";
+  const KV_KEY = "state_v4";
 
-  const LS_FALLBACK_KEY = "discipline.checklist.fallback.v3";
-  const HISTORY_DAYS_TO_KEEP = 90;
+  // localStorage snapshot fallback
+  const LS_FALLBACK_KEY = "warrior.checklist.snapshot.v4";
 
-  // User wants GED optional INCLUDED in completion %
+  // Cross-tab sync
+  const CHANNEL_NAME = "warrior_checklist_channel_v4";
+
+  // Housekeeping
+  const HISTORY_DAYS_TO_KEEP = 120;
+
+  // Optional items INCLUDED in % (per your earlier rule)
   const EXCLUDE_OPTIONAL_FROM_PERCENT = false;
+
+  // ====== THEMES ======
+  const THEME_IDS = ["warrior", "iron", "stealth", "desert", "christian"];
 
   // ====== TASKS ======
   const BASE_TASKS = [
@@ -31,7 +43,7 @@
     { id: "pullups_25", label: "25 pull ups outside", desc: "Full range.", required: true },
     { id: "bible_30", label: "Read Bible 30 mins", desc: "Timer: 30:00.", required: true },
     { id: "journal_am", label: "Journal (morning)", desc: "Plan, intention, focus.", required: true },
-    { id: "ged_optional", label: "Study GED", desc: "Optional, but counts in %.", required: false },
+    { id: "ged_optional", label: "Study GED", desc: "Optional (counts in %).", required: false },
     { id: "hillsdale", label: "Study Hillsdale class", desc: "Show up daily.", required: true },
     { id: "study_ai_45", label: "Study AI 45 mins", desc: "Timer: 45:00.", required: true },
     { id: "meditate_10", label: "Meditate 10 mins", desc: "Timer: 10:00.", required: true },
@@ -59,21 +71,50 @@
   const needCountEl = $("#needCount");
   const barFillEl = $("#barFill");
   const statusEl = $("#status");
+  const storageInfoEl = $("#storageInfo");
   const btnResetDay = $("#btnResetDay");
   const btnMarkAll = $("#btnMarkAll");
+  const themeSelectEl = $("#themeSelect");
 
   // ====== UTILS ======
   const pad2 = (n) => String(n).padStart(2, "0");
+  const nowMs = () => Date.now();
 
   function safeJsonParse(str, fallback) {
     try { return JSON.parse(str); } catch { return fallback; }
   }
 
-  function nowMs() { return Date.now(); }
+  function stableStringify(obj) {
+    // Simple stable stringify for hashing-ish consistency (industry-ish; not cryptographic)
+    const seen = new WeakSet();
+    const sorter = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+    const walk = (x) => {
+      if (x && typeof x === "object") {
+        if (seen.has(x)) return null;
+        seen.add(x);
+        if (Array.isArray(x)) return x.map(walk);
+        const out = {};
+        for (const k of Object.keys(x).sort(sorter)) out[k] = walk(x[k]);
+        return out;
+      }
+      return x;
+    };
+
+    return JSON.stringify(walk(obj));
+  }
+
+  function makeId() {
+    try {
+      return crypto.randomUUID();
+    } catch {
+      // fallback
+      return "dev_" + Math.random().toString(16).slice(2) + "_" + Date.now().toString(16);
+    }
+  }
 
   // ====== PHOENIX TIME CORE ======
   function getTimeZoneOffsetMinutes(timeZone, date = new Date()) {
-    // Prefer modern "shortOffset" if supported
     try {
       const fmt = new Intl.DateTimeFormat("en-US", {
         timeZone,
@@ -90,7 +131,7 @@
       }
     } catch { /* fall through */ }
 
-    // Phoenix has no DST; fallback is always UTC-07:00
+    // Phoenix no DST fallback
     return -7 * 60;
   }
 
@@ -98,7 +139,7 @@
     return getTimeZoneOffsetMinutes(PHX_TZ, now) * 60 * 1000;
   }
 
-  // Phoenix "wall time epoch", represented as pseudo-UTC in ms.
+  // Phoenix wall epoch represented as pseudo-UTC
   function phoenixWallEpoch(now = new Date()) {
     return now.getTime() + phoenixOffsetMs(now);
   }
@@ -118,7 +159,7 @@
     return fmt.format(now);
   }
 
-  // Discipline day key = date of (Phoenix wall time - 2 hours)
+  // Discipline day key = date of (Phoenix wall time - resetHour)
   function getDisciplineDayKey(now = new Date()) {
     const shifted = phoenixWallEpoch(now) - RESET_HOUR_PHOENIX * 60 * 60 * 1000;
     const d = new Date(shifted);
@@ -169,12 +210,12 @@
     return { tasks, fasting };
   }
 
-  // ====== STORAGE ENGINE (IndexedDB + fallback) ======
+  // ====== STORAGE (IndexedDB + snapshot fallback) ======
   function openDb() {
     return new Promise((resolve, reject) => {
       if (!("indexedDB" in window)) return reject(new Error("IndexedDB not supported"));
-
       const req = indexedDB.open(DB_NAME, DB_VERSION);
+
       req.onupgradeneeded = () => {
         const db = req.result;
         if (!db.objectStoreNames.contains(STORE_NAME)) db.createObjectStore(STORE_NAME);
@@ -184,7 +225,7 @@
     });
   }
 
-  async function idbGet(db, key) {
+  function idbGet(db, key) {
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, "readonly");
       const store = tx.objectStore(STORE_NAME);
@@ -194,7 +235,7 @@
     });
   }
 
-  async function idbPut(db, key, value) {
+  function idbPut(db, key, value) {
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, "readwrite");
       const store = tx.objectStore(STORE_NAME);
@@ -207,7 +248,6 @@
   function lsGet() {
     return safeJsonParse(localStorage.getItem(LS_FALLBACK_KEY), null);
   }
-
   function lsPut(value) {
     try {
       localStorage.setItem(LS_FALLBACK_KEY, JSON.stringify(value));
@@ -217,12 +257,33 @@
     }
   }
 
+  async function requestPersistentStorage() {
+    try {
+      if (navigator.storage && navigator.storage.persist) {
+        const granted = await navigator.storage.persist();
+        return !!granted;
+      }
+    } catch { /* ignore */ }
+    return false;
+  }
+
+  async function storageEstimate() {
+    try {
+      if (navigator.storage && navigator.storage.estimate) {
+        return await navigator.storage.estimate();
+      }
+    } catch { /* ignore */ }
+    return null;
+  }
+
   // ====== STATE MODEL ======
   function defaultState() {
     return {
-      version: 3,
+      version: 4,
       updatedAt: nowMs(),
+      deviceId: makeId(),
       activeDayKey: null,
+      themeId: "warrior",
       days: {} // dayKey -> { createdAt, completed: {id:boolean} }
     };
   }
@@ -235,63 +296,80 @@
   }
 
   function ensureDayRecord(state, dayKey, tasks) {
-    if (!state.days[dayKey]) {
-      state.days[dayKey] = { createdAt: nowMs(), completed: {} };
-    }
+    if (!state.days[dayKey]) state.days[dayKey] = { createdAt: nowMs(), completed: {} };
     const rec = state.days[dayKey];
 
     for (const t of tasks) {
       if (typeof rec.completed[t.id] !== "boolean") rec.completed[t.id] = false;
     }
+
     const valid = new Set(tasks.map(t => t.id));
     for (const id of Object.keys(rec.completed)) {
       if (!valid.has(id)) delete rec.completed[id];
     }
   }
 
-  // ====== SAVE COALESCING ======
+  function sanitizeThemeId(themeId) {
+    return THEME_IDS.includes(themeId) ? themeId : "warrior";
+  }
+
+  // ====== PERSISTENCE (coalesced + hardened) ======
   let saveInFlight = false;
   let saveQueued = false;
   let lastSaveOk = false;
-  let storageMode = "IDB"; // or "LS"
+  let storageMode = "IDB";
+  let lastSavedHash = "";
 
   async function persist(state, db) {
-    // Coalesce rapid saves into one at a time
     if (saveInFlight) { saveQueued = true; return; }
     saveInFlight = true;
 
     try {
       state.updatedAt = nowMs();
 
-      // Primary: IDB
+      const hash = stableStringify({
+        updatedAt: state.updatedAt,
+        activeDayKey: state.activeDayKey,
+        themeId: state.themeId,
+        deviceId: state.deviceId,
+        days: state.days
+      });
+      // Avoid redundant writes if nothing changed except tick UI
+      if (hash === lastSavedHash) {
+        lastSaveOk = true;
+        return;
+      }
+
       if (db) {
         await idbPut(db, KV_KEY, state);
-        lastSaveOk = true;
         storageMode = "IDB";
-        // Also write fallback snapshot occasionally (best-effort)
+        lastSaveOk = true;
+        // Best-effort snapshot
         lsPut(state);
       } else {
-        // Fallback: localStorage only
-        lastSaveOk = lsPut(state);
         storageMode = "LS";
+        lastSaveOk = lsPut(state);
       }
+
+      lastSavedHash = hash;
     } catch {
-      // If IDB write fails, fallback to LS
-      lastSaveOk = lsPut(state);
       storageMode = "LS";
+      lastSaveOk = lsPut(state);
     } finally {
       saveInFlight = false;
       if (saveQueued) { saveQueued = false; await persist(state, db); }
     }
   }
 
-  function setStatus(msg) {
-    statusEl.textContent = msg;
-  }
-
   function statusSavedLine(now = new Date()) {
     const ok = lastSaveOk ? "OK" : "FAIL";
     return `Saved(${ok}) via ${storageMode} • ${formatPhoenixNow(now)}`;
+  }
+
+  // ====== UI / THEMES ======
+  function applyTheme(themeId) {
+    document.body.dataset.theme = sanitizeThemeId(themeId);
+    if (themeSelectEl) themeSelectEl.value = sanitizeThemeId(themeId);
   }
 
   // ====== PROGRESS ======
@@ -346,7 +424,8 @@
         rec.completed[t.id] = cb.checked;
         refreshProgress(dayKey, state);
         await persist(state, db);
-        setStatus(statusSavedLine(new Date()));
+        statusEl.textContent = statusSavedLine(new Date());
+        broadcastState(state);
       }, { passive: true });
 
       const meta = document.createElement("div");
@@ -395,7 +474,8 @@
 
     render(dayKey, state, db);
     await persist(state, db);
-    setStatus(`Marked all • ${statusSavedLine(new Date())}`);
+    statusEl.textContent = `Marked all • ${statusSavedLine(new Date())}`;
+    broadcastState(state);
   }
 
   async function resetToday(state, db) {
@@ -406,7 +486,64 @@
 
     render(dayKey, state, db);
     await persist(state, db);
-    setStatus(`Reset today • ${statusSavedLine(new Date())}`);
+    statusEl.textContent = `Reset today • ${statusSavedLine(new Date())}`;
+    broadcastState(state);
+  }
+
+  // ====== CROSS-TAB SYNC ======
+  let bc = null;
+
+  function openChannel() {
+    try {
+      if ("BroadcastChannel" in window) {
+        bc = new BroadcastChannel(CHANNEL_NAME);
+        bc.onmessage = (ev) => {
+          const msg = ev?.data;
+          if (!msg || msg.type !== "STATE") return;
+          // Only accept if from same deviceId (avoids weird merges if you copy state)
+          // If you *want* shared merges across copied states, remove this guard.
+          // We'll still accept theme change even if day differs.
+          onIncomingState(msg.payload);
+        };
+      }
+    } catch {
+      bc = null;
+    }
+  }
+
+  function broadcastState(state) {
+    if (!bc) return;
+    try {
+      bc.postMessage({
+        type: "STATE",
+        payload: {
+          deviceId: state.deviceId,
+          updatedAt: state.updatedAt,
+          activeDayKey: state.activeDayKey,
+          themeId: state.themeId,
+          days: state.days
+        }
+      });
+    } catch { /* ignore */ }
+  }
+
+  function onIncomingState(payload) {
+    if (!payload || typeof payload !== "object") return;
+    // We only merge if same deviceId to keep it “this device remembers”
+    if (payload.deviceId && appState.deviceId && payload.deviceId !== appState.deviceId) return;
+
+    // If incoming is newer, merge and rerender
+    if (typeof payload.updatedAt === "number" && payload.updatedAt > appState.updatedAt) {
+      appState.updatedAt = payload.updatedAt;
+      appState.activeDayKey = payload.activeDayKey || appState.activeDayKey;
+      appState.themeId = sanitizeThemeId(payload.themeId || appState.themeId);
+      if (payload.days && typeof payload.days === "object") appState.days = payload.days;
+
+      applyTheme(appState.themeId);
+      const dk = appState.activeDayKey || getDisciplineDayKey(new Date());
+      render(dk, appState, dbRef);
+      statusEl.textContent = `Synced from other tab • ${formatPhoenixNow(new Date())}`;
+    }
   }
 
   // ====== AUTO-RESET / TICK ======
@@ -427,67 +564,107 @@
 
       render(currentKey, state, db);
       await persist(state, db);
-      setStatus(`New discipline day loaded • ${statusSavedLine(now)}`);
+      statusEl.textContent = `New discipline day loaded • ${statusSavedLine(now)}`;
+      broadcastState(state);
     }
   }
 
   // ====== LOAD ======
   async function loadState(db) {
-    // Try IDB first
     if (db) {
       try {
         const s = await idbGet(db, KV_KEY);
         if (s && typeof s === "object") return s;
       } catch { /* ignore */ }
     }
-    // Fallback localStorage
-    const ls = lsGet();
-    if (ls && typeof ls === "object") return ls;
-
+    const snap = lsGet();
+    if (snap && typeof snap === "object") return snap;
     return defaultState();
   }
 
+  // ====== GLOBALS FOR SYNC HANDLER ======
+  let dbRef = null;
+  let appState = null;
+
   // ====== BOOT ======
   async function boot() {
-    let db = null;
-    try { db = await openDb(); } catch { db = null; }
+    // DB open
+    try { dbRef = await openDb(); } catch { dbRef = null; }
 
-    const state = await loadState(db);
+    // Load state
+    appState = await loadState(dbRef);
 
+    // Ensure deviceId persists (device memory)
+    if (!appState.deviceId) appState.deviceId = makeId();
+
+    // Theme sanity
+    appState.themeId = sanitizeThemeId(appState.themeId || "warrior");
+    applyTheme(appState.themeId);
+
+    // Set day key
     const now = new Date();
     const dayKey = getDisciplineDayKey(now);
-    state.activeDayKey = dayKey;
+    appState.activeDayKey = dayKey;
 
     const { tasks } = tasksForDay(dayKey);
-    ensureDayRecord(state, dayKey, tasks);
-    pruneOldDays(state);
+    ensureDayRecord(appState, dayKey, tasks);
+    pruneOldDays(appState);
 
-    render(dayKey, state, db);
-    await persist(state, db);
-    setStatus(`Ready • ${statusSavedLine(now)}`);
+    // Cross-tab channel
+    openChannel();
+
+    // Theme selector
+    if (themeSelectEl) {
+      themeSelectEl.value = appState.themeId;
+      themeSelectEl.addEventListener("change", async () => {
+        const chosen = sanitizeThemeId(themeSelectEl.value);
+        appState.themeId = chosen;
+        applyTheme(chosen);
+        await persist(appState, dbRef);
+        statusEl.textContent = `Theme set: ${chosen} • ${statusSavedLine(new Date())}`;
+        broadcastState(appState);
+      });
+    }
+
+    // Initial render + save
+    render(dayKey, appState, dbRef);
+    await persist(appState, dbRef);
+    statusEl.textContent = `Ready • ${statusSavedLine(now)}`;
+
+    // Storage durability details
+    const persisted = await requestPersistentStorage();
+    const est = await storageEstimate();
+    const quota = est?.quota ? Math.round(est.quota / (1024 * 1024)) : null;
+    const usage = est?.usage ? Math.round(est.usage / (1024 * 1024)) : null;
+
+    storageInfoEl.textContent =
+      `Device: ${appState.deviceId.slice(0, 8)}… • Persist: ${persisted ? "ON" : "OFF"}`
+      + (quota != null && usage != null ? ` • Storage: ${usage}MB/${quota}MB` : "");
 
     // Buttons
-    btnMarkAll.addEventListener("click", () => markAll(state, db));
+    btnMarkAll.addEventListener("click", () => markAll(appState, dbRef));
     btnResetDay.addEventListener("click", async () => {
       const ok = confirm("Reset TODAY (current discipline day) back to unchecked?");
-      if (ok) await resetToday(state, db);
+      if (ok) await resetToday(appState, dbRef);
     });
 
-    // Hardening: save on tab hide / page close
+    // Save on tab hide / close (iOS friendly)
     document.addEventListener("visibilitychange", async () => {
       if (document.visibilityState === "hidden") {
-        await persist(state, db);
+        await persist(appState, dbRef);
       }
     });
 
-    // iOS Safari friendly: pagehide fires reliably on close/app switch
     window.addEventListener("pagehide", async () => {
-      await persist(state, db);
+      await persist(appState, dbRef);
     });
 
-    // Run tick immediately, then every second to keep countdown & catch 2am quickly
-    await tick(state, db);
-    setInterval(() => { tick(state, db); }, 1000);
+    // Periodic safety flush (in case of odd browser conditions)
+    setInterval(() => { persist(appState, dbRef); }, 30_000);
+
+    // Tick loop: countdown + 2am rollover
+    await tick(appState, dbRef);
+    setInterval(() => { tick(appState, dbRef); }, 1000);
   }
 
   boot();
