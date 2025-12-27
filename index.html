@@ -5,7 +5,12 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <meta name="color-scheme" content="dark light" />
   <title>Warrior Checklist</title>
+
   <style>
+    /* ========= Theme System =========
+       Themes are applied via: <body data-theme="warrior|iron|stealth|desert|christian">
+       Colors are CSS variables to keep everything clean and “industry grade”.
+    */
     :root{
       --bg: #0b0f14;
       --panel: #0f1720;
@@ -17,22 +22,64 @@
       --warn: #f0c35a;
       --shadow: 0 10px 30px rgba(0,0,0,0.55);
       --radius: 16px;
+
+      --glowA: rgba(211,75,75,0.18);
+      --glowB: rgba(43,213,118,0.10);
+
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
     }
+
+    body[data-theme="warrior"]{
+      --bg:#0b0f14; --panel:#0f1720; --text:#e8edf4; --muted:#9aa7b5;
+      --accent:#d34b4b; --good:#2bd576; --warn:#f0c35a;
+      --glowA: rgba(211,75,75,0.18); --glowB: rgba(43,213,118,0.10);
+    }
+    body[data-theme="iron"]{
+      --bg:#070a0e; --panel:#0c121a; --text:#eef2f7; --muted:#a6b2c0;
+      --accent:#9aa7b5; --good:#51e3a2; --warn:#f3d27a;
+      --glowA: rgba(154,167,181,0.16); --glowB: rgba(81,227,162,0.09);
+    }
+    body[data-theme="stealth"]{
+      --bg:#05070b; --panel:#090f16; --text:#e7f0ff; --muted:#89a0b8;
+      --accent:#5aa7ff; --good:#3ddc97; --warn:#ffd36a;
+      --glowA: rgba(90,167,255,0.16); --glowB: rgba(61,220,151,0.08);
+    }
+    body[data-theme="desert"]{
+      --bg:#0c0a08; --panel:#14100c; --text:#f2e9df; --muted:#c7b6a6;
+      --accent:#e08a3a; --good:#46d48f; --warn:#f3d27a;
+      --glowA: rgba(224,138,58,0.18); --glowB: rgba(70,212,143,0.08);
+    }
+    body[data-theme="christian"]{
+      --bg:#070a12; --panel:#0c1220; --text:#ecf2ff; --muted:#a6b6d1;
+      --accent:#d8b15c; --good:#38d18a; --warn:#f2d38a;
+      --glowA: rgba(216,177,92,0.16); --glowB: rgba(56,209,138,0.08);
+    }
+
     *{ box-sizing:border-box; }
     body{
       margin:0;
       font-family: var(--sans);
-      background:
-        radial-gradient(1100px 780px at 20% -10%, rgba(211,75,75,0.20), transparent 50%),
-        radial-gradient(900px 650px at 120% 0%, rgba(43,213,118,0.10), transparent 50%),
-        var(--bg);
       color: var(--text);
+      background:
+        radial-gradient(1100px 780px at 20% -10%, var(--glowA), transparent 52%),
+        radial-gradient(900px 650px at 120% 0%, var(--glowB), transparent 55%),
+        var(--bg);
     }
-    .wrap{ max-width: 980px; margin:0 auto; padding: 22px 16px 40px; }
-    header{ display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; justify-content:space-between; margin-bottom: 14px; }
+
+    .wrap{ max-width: 1020px; margin:0 auto; padding: 22px 16px 40px; }
+
+    header{
+      display:flex;
+      flex-wrap:wrap;
+      gap: 12px;
+      align-items:flex-end;
+      justify-content:space-between;
+      margin-bottom: 14px;
+    }
+
     h1{ font-size: 22px; margin:0; letter-spacing:0.4px; }
+
     .sub{
       color: var(--muted);
       font-size: 13px;
@@ -43,6 +90,7 @@
       font-family: var(--mono);
       margin-top: 8px;
     }
+
     .pill{
       border: 1px solid var(--line);
       border-radius: 999px;
@@ -51,6 +99,7 @@
       white-space: nowrap;
     }
     .pill strong{ color: var(--text); }
+
     .fasting{
       border-color: rgba(240,195,90,0.35);
       background: rgba(240,195,90,0.08);
@@ -64,6 +113,7 @@
       box-shadow: var(--shadow);
       overflow:hidden;
     }
+
     .panelHead{
       padding: 14px 16px;
       border-bottom: 1px solid var(--line);
@@ -85,6 +135,7 @@
       font-family: var(--mono);
       flex-wrap: wrap;
     }
+
     .bar{
       height: 10px;
       background: rgba(255,255,255,0.06);
@@ -99,7 +150,8 @@
       transition: width 220ms ease;
     }
 
-    .actions{ display:flex; flex-wrap:wrap; gap:10px; justify-content:flex-end; }
+    .actions{ display:flex; flex-wrap:wrap; gap:10px; justify-content:flex-end; align-items:center; }
+
     button{
       appearance:none;
       border: 1px solid var(--line);
@@ -117,6 +169,18 @@
     button.danger{
       border-color: rgba(211,75,75,0.35);
       background: rgba(211,75,75,0.10);
+    }
+
+    .select{
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.03);
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: 12px;
+      font-weight: 800;
+      font-family: var(--sans);
+      cursor: pointer;
+      outline: none;
     }
 
     .list{ padding: 6px 0; }
@@ -140,6 +204,7 @@
       text-overflow: ellipsis;
       max-width: 100%;
     }
+
     .tag{
       font-size: 11px;
       padding: 3px 8px;
@@ -163,6 +228,7 @@
       background: rgba(240,195,90,0.10);
       color: #ffe1a4;
     }
+
     .desc{ font-size: 12px; color: var(--muted); font-family: var(--mono); }
 
     input[type="checkbox"]{
@@ -184,10 +250,19 @@
       justify-content: space-between;
       align-items:center;
     }
+
+    .rightTop {
+      display:flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: flex-end;
+      margin-top: 6px;
+    }
   </style>
 </head>
 
-<body>
+<body data-theme="warrior">
   <div class="wrap">
     <header>
       <div>
@@ -199,6 +274,16 @@
           <span class="pill">Next reset in: <strong id="countdown">—</strong></span>
           <span class="pill fasting" id="fastingPill" style="display:none;">FASTING DAY (Required)</span>
         </div>
+      </div>
+
+      <div class="rightTop">
+        <select id="themeSelect" class="select" aria-label="Theme">
+          <option value="warrior">Warrior</option>
+          <option value="iron">Iron</option>
+          <option value="stealth">Stealth</option>
+          <option value="desert">Desert</option>
+          <option value="christian">Christian</option>
+        </select>
       </div>
     </header>
 
@@ -223,7 +308,7 @@
 
     <footer>
       <div id="status">—</div>
-      <div>Persisted via IndexedDB (fallback: localStorage)</div>
+      <div id="storageInfo">—</div>
     </footer>
   </div>
 
